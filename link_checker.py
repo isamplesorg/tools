@@ -1,10 +1,10 @@
 import asyncio
+import sys
 from ssl import SSLCertVerificationError, SSLError
+from typing import Optional
 
 import click
 import httpx
-import logging
-from aiofile import AIOFile, Writer
 from httpx import ReadTimeout, ConnectError, ConnectTimeout, ReadError, TooManyRedirects, RemoteProtocolError, \
     UnsupportedProtocol
 
@@ -16,7 +16,7 @@ async def _prepare_url(url: str) -> str:
         return url
 
 
-async def _check_link(url: str, aiodf: AIOFile, writer: Writer, timeout: int):
+async def _check_link(url: str, timeout: int) -> str:
     try:
         headers = {"User-Agent": "iSamples-Link-Checker/0.0.1"}
         async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
@@ -49,37 +49,57 @@ async def _check_link(url: str, aiodf: AIOFile, writer: Writer, timeout: int):
         line = f"{url},-1,{ssle.__cause__}"
     except UnsupportedProtocol as unsp:
         line = f"{url},-1,{unsp.__cause__}"
-    line = line + "\n"
-    await writer(line)
-    await aiodf.fsync()
+    return line
 
 
-async def _main(output_file: str, conn_count: int, link_set: set[str], timeout: int):
-    async with AIOFile(output_file, "w") as aiodf:
-        writer = Writer(aiodf)
-        header = """link,status,notes\n"""
-        await writer(header)
-        await aiodf.fsync()
-        tasks = [asyncio.create_task(_check_link(url, aiodf, writer, timeout)) for url in link_set]
-        await asyncio.gather(*tasks)
+async def _main(output_file: Optional[str], conn_count: int, link_set: set[str], timeout: int):
+    lines = ["link,status,notes"]
+    if output_file is not None:
+        lines.append("\n")
+    current_batch_size = 0
+    current_tasks = []
+    for url in link_set:
+        if current_batch_size == conn_count:
+            lines_batch = await asyncio.gather(*current_tasks)
+            lines.extend(lines_batch)
+            current_batch_size = 0
+            current_tasks = []
+        else:
+            current_tasks.append(asyncio.create_task(_check_link(url, timeout)))
+            current_batch_size += 1
+    if len(current_tasks) > 0:
+        lines_batch = await asyncio.gather(*current_tasks)
+        lines.extend(lines_batch)
+    if output_file is not None:
+        with open(output_file, "w") as f:
+            for line in lines:
+                f.write(line + "\n")
+    else:
+        for line in lines:
+            print(line)
 
 
-
+def _gather_lines(input_file) -> set:
+    link_set = set()
+    for line in input_file:
+        stripped = line.strip()
+        if len(stripped) > 0:
+            link_set.add(stripped)
+    return link_set
 
 @click.command()
-@click.option("-i", "--input_file", help="Input file, one link per line.")
-@click.option("-o", "--output_file", help="Output file, CSV formatted.")
+@click.option("-i", "--input_file", default=None, help="Input file, one link per line.")
+@click.option("-o", "--output_file", default=None, help="Output file, CSV formatted.")
 @click.option("-c", "--concurrent_requests", default=50, help="The max number of concurrent requests to allow.")
 @click.option("-t", "--timeout", default=5, help="The number of seconds to wait before timing out.")
 def main(input_file: str, output_file: str, concurrent_requests: int, timeout: int):
     """Program that takes a list of links in a file as input and writes a CSV file with the result of checking
     those links."""
-    link_set = set()
-    with open(input_file, "r") as input_file:
-        for line in input_file:
-            stripped = line.strip()
-            if len(stripped) > 0:
-                link_set.add(stripped)
+    if input_file is not None:
+        with open(input_file, "r") as input_file:
+            link_set = _gather_lines(input_file)
+    else:
+        link_set = _gather_lines(sys.stdin)
     asyncio.run(_main(output_file, concurrent_requests, link_set, timeout))
 
 
